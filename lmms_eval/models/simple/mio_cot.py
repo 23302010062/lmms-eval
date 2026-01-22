@@ -223,21 +223,28 @@ class MIOVisualCoT(lmms):
                 eval_logger.error(error_msg)
                 raise ValueError(error_msg)
 
-            # Prepare conversation for image generation with original image
-            # MIO uses special tokens for generation mode
+            # Prepare conversation for conditional image generation (image edit/img2img)
+            # Based on MIO official implementation:
+            # - Pure generation (imagen): no placeholder, batch_image_paths=None
+            # - Understanding (img_und): has placeholder, batch_image_paths provided  
+            # - Conditional generation (edit): placeholder + batch_image_paths, request new image in prompt
+            # 
+            # For Visual CoT: provide original image, ask model to generate visualization
+            # The model will see the original image and generate NEW image tokens
             image_placeholder = "<image_placeholder_0>"
-            prompt_with_image = f"{image_placeholder}\n{generation_prompt}\nGenerate: <image>"
+            prompt_with_image = f"{image_placeholder}\n{generation_prompt}"
             
-            eval_logger.info(f"Stage 1 - Prompt with image placeholder: {prompt_with_image[:150]}")
+            eval_logger.info(f"Stage 1 - Generation prompt: {generation_prompt[:200]}...")
+            eval_logger.info(f"Stage 1 - Conditional generation: providing original image as context")
 
             conversations = [[{"role": "user", "content": prompt_with_image}]]
 
-            # Apply chat template for generation mode with original image
+            # Apply chat template WITH input images (conditional image generation)
             inputs = self.tokenizer.apply_chat_template(
                 conversations,
-                batch_image_paths=[image_paths],  # Pass original image
+                batch_image_paths=[image_paths],  # Provide original image for conditioning
                 batch_speech_paths=None,
-                mode='gen',  # Use generation mode
+                mode='std',
                 padding=True,
                 truncation=True,
                 max_length=2048,
@@ -247,13 +254,16 @@ class MIOVisualCoT(lmms):
             input_ids = inputs['input_ids'].to(self._device)
             attention_mask = inputs['attention_mask'].to(self._device)
 
-            # Generate
+            # Generate using official multimodal interleaved generation config
+            # Per MIO official docs: num_beams=1, do_sample=True, repetition_penalty=1.15
             gen_config = {
-                "num_beams": 1,
-                "do_sample": True,
+                "num_beams": 1,  # Multimodal interleaved: num_beams=1
+                "do_sample": True,  # Multimodal interleaved: do_sample=True
                 "temperature": 1.0,
-                "top_p": 0.9,
-                "max_new_tokens": 1024,  # Need enough tokens for image generation
+                "top_p": 0.7,
+                "repetition_penalty": 1.15,
+                "max_new_tokens": 512,
+                "length_penalty": 1.0,
                 "pad_token_id": self.tokenizer.tokenizer.pad_token_id,
                 "eos_token_id": 7,  # <|im_end|>
             }
@@ -308,16 +318,16 @@ class MIOVisualCoT(lmms):
                 raise
 
     def _stage2_answer_with_image(
-        self, question: str, image_path: str, doc_id: str, original_image: Optional[Image.Image] = None
+        self, question: str, image_path: Optional[str], doc_id: str, original_image: Optional[Image.Image] = None
     ) -> str:
         """
-        Stage 2: Answer question using generated image (and optionally original image)
+        Stage 2: Answer question using images (original and/or auxiliary)
 
         Args:
             question: Original question text (cleaned, without GEN_PROMPT tags)
-            image_path: Path to generated auxiliary image
+            image_path: Path to generated auxiliary image (None if not generated)
             doc_id: Document ID for logging
-            original_image: Original image (optional, used as primary reference)
+            original_image: Original image (required if image_path is None)
 
         Returns:
             Answer text
@@ -326,17 +336,12 @@ class MIOVisualCoT(lmms):
         eval_logger.debug(f"Question: {question}")
 
         try:
-            # Load generated auxiliary image
-            auxiliary_image = Image.open(image_path).convert("RGB")
-
-            # Prepare image paths: original image (if provided) + auxiliary image
+            # Prepare image paths: original image (if provided) + auxiliary image (if generated)
             image_paths = []
             temp_files = []
 
-            # If original image is provided, use both images (original as primary, auxiliary as reference)
+            # Add original image first (primary reference)
             if original_image is not None:
-                eval_logger.info(f"Stage 2 - Using both original and auxiliary images for doc {doc_id}")
-                # Add original image first (primary reference)
                 if isinstance(original_image, str):
                     image_paths.append(original_image)
                 elif isinstance(original_image, Image.Image):
@@ -346,15 +351,21 @@ class MIOVisualCoT(lmms):
                     tmp.close()
                     image_paths.append(tmp.name)
                     temp_files.append(tmp.name)
-            else:
-                eval_logger.info(f"Stage 2 - Using auxiliary image only for doc {doc_id}")
             
-            # Add generated auxiliary image (reference/visualization)
-            image_paths.append(image_path)
-            eval_logger.info(f"Stage 2 - Total images: {len(image_paths)} (order: {'original+auxiliary' if len(image_paths) > 1 else 'auxiliary only'})")
+            # Add generated auxiliary image if available
+            if image_path is not None:
+                auxiliary_image = Image.open(image_path).convert("RGB")
+                image_paths.append(image_path)
+                eval_logger.info(f"Stage 2 - Using both original and auxiliary images for doc {doc_id}")
+            else:
+                eval_logger.info(f"Stage 2 - Using original image only for doc {doc_id}")
+            
+            if len(image_paths) == 0:
+                raise ValueError(f"No images available for Stage 2 (doc {doc_id})")
+                
+            eval_logger.info(f"Stage 2 - Total images: {len(image_paths)} (order: {'original+auxiliary' if len(image_paths) > 1 else 'original only'})")
 
             # Prepare conversation with image placeholders
-            # Image order: [original_image (if exists), auxiliary_image] + question
             image_placeholders = "".join([f"<image_placeholder_{i}>" for i in range(len(image_paths))])
             prompt_with_images = f"{image_placeholders}\n{question}"
 
@@ -510,7 +521,14 @@ class MIOVisualCoT(lmms):
                 # Use custom generation prompt from task config
                 custom_gen_prompt = gen_prompt_match.group(1).strip()
                 actual_question = question_match.group(1).strip()
-                generation_prompt = custom_gen_prompt.replace("{question}", actual_question)
+                
+                # Replace {question} placeholder if exists, otherwise append question
+                if "{question}" in custom_gen_prompt:
+                    generation_prompt = custom_gen_prompt.replace("{question}", actual_question)
+                else:
+                    # Append question to generation prompt
+                    generation_prompt = f"{custom_gen_prompt}\n\nQuestion: {actual_question}"
+                
                 # Update contexts to be just the question for stage 2 (remove tags)
                 contexts = contexts.replace(f"[GEN_PROMPT]{gen_prompt_match.group(1)}[/GEN_PROMPT]", "")
                 contexts = contexts.replace(f"[QUESTION]{question_match.group(1)}[/QUESTION]", question_match.group(1))
@@ -532,24 +550,29 @@ class MIOVisualCoT(lmms):
                 original_image=original_image,  # MUST pass original image
             )
 
-            # Check if image was generated
+            # Stage 2: Answer question 
+            # If no auxiliary image was generated, still use original image to answer
+            # Note: contexts has been cleaned to contain only the question text (GEN_PROMPT tags removed)
             if not generated_images or len(generated_images) == 0:
                 eval_logger.warning(
-                    f"No image generated for doc {doc_id}, using stage 1 text as answer"
+                    f"No auxiliary image generated for doc {doc_id}, using original image only in Stage 2"
                 )
-                res.append(stage1_text if stage1_text else "")
-                pbar.update(1)
-                continue
-
-            # Stage 2: Answer question using generated image (and original image if available)
-            # Note: contexts has been cleaned to contain only the question text (GEN_PROMPT tags removed)
-            # Image order in stage2: [original_image (primary), auxiliary_image (reference)]
-            final_answer = self._stage2_answer_with_image(
-                question=contexts,  # Clean question text without tags
-                image_path=generated_images[0],  # Generated auxiliary/visualization image
-                doc_id=doc_id,
-                original_image=original_image  # Original image as primary reference
-            )
+                # Stage 2 with original image only (no auxiliary)
+                final_answer = self._stage2_answer_with_image(
+                    question=contexts,
+                    image_path=None,  # No auxiliary image
+                    doc_id=doc_id,
+                    original_image=original_image  # Only original image
+                )
+            else:
+                # Stage 2 with both original and auxiliary images
+                # Image order: [original_image (primary), auxiliary_image (reference)]
+                final_answer = self._stage2_answer_with_image(
+                    question=contexts,  # Clean question text without tags
+                    image_path=generated_images[0],  # Generated auxiliary/visualization image
+                    doc_id=doc_id,
+                    original_image=original_image  # Original image as primary reference
+                )
 
             # Save intermediate artifacts if enabled
             self._save_intermediate_artifacts(
