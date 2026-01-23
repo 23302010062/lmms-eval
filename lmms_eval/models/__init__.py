@@ -80,6 +80,8 @@ AVAILABLE_SIMPLE_MODELS = {
     "slime": "Slime",
     "srt_api": "SRT_API",
     "tinyllava": "TinyLlava",
+    "uniworld": "UniWorld",
+    "uniworld_visual_cot": "UniWorldVisualCoT",
     "videoChatGPT": "VideoChatGPT",
     "videochat2": "VideoChat2",
     "videollama3": "VideoLLaMA3",
@@ -96,6 +98,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "videochat_flash": "VideoChat_Flash",
     "javisgpt": "JavisGPT",
     "javisgpt_visual_cot": "JavisGPTVisualCoT",
+    "janus_pro": "JanusPro",
     "janus_pro_visual_cot": "JanusProVisualCoT",
     "onecat": "OneCAT",
     "onecat_visual_cot": "OneCATVisualCoT",
@@ -105,6 +108,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "whisper_vllm": "WhisperVllm",
     "vora": "VoRA",
     "unipic2": "UniPic2",
+    "unipic2_visual_cot": "UniPic2VisualCoT",
 }
 
 AVAILABLE_CHAT_TEMPLATE_MODELS = {
