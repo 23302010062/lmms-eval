@@ -279,109 +279,301 @@ class JanusProVisualCoT(lmms):
     def _stage1_generate_image(
         self, generation_prompt: str, doc_id: str, task: str, original_image=None
     ) -> Tuple[str, List[str]]:
-        """Stage 1: Generate visualization image using Janus-Pro generation."""
+        """
+        Stage 1: Generate visualization image from prompt (conditioned on original image)
+
+        Args:
+            generation_prompt: Text prompt for image generation
+            doc_id: Document ID for file naming
+            task: Task name for file naming
+            original_image: Original image to condition on (optional)
+
+        Returns:
+            Tuple of (generated_text, list_of_image_paths)
+        """
+        eval_logger.debug(f"Stage 1 - Generating image for doc {doc_id}")
+        eval_logger.debug(f"Generation prompt: {generation_prompt}")
+
         try:
+            # Extract and prepare original image
             original_image = self._extract_image_from_various_formats(original_image)
+            if original_image is not None:
+                eval_logger.debug("Stage 1 - Using original image as conditioning input")
 
-            # Build conversation for generation
-            images = [original_image] if original_image else []
-            if images:
-                image_placeholders = "<image_placeholder>\n" * len(images)
-                user_content = image_placeholders + generation_prompt
-            else:
-                user_content = generation_prompt
-
-            conversation = [
-                {
-                    "role": "User",
-                    "content": user_content,
-                    "images": images,
-                },
-                {"role": "Assistant", "content": ""},
-            ]
-
-            # Apply SFT template and add image_start_tag to trigger generation
-            sft_format = self._processor.apply_sft_template_for_multi_turn_prompts(
-                conversations=conversation,
-                sft_format=self._processor.sft_format,
-                system_prompt="",
+            # Prepare conditional inputs (with image and prompt)
+            inputs_embeds_cond, attention_mask_cond = self._prepare_conditional_inputs(
+                generation_prompt, original_image
             )
-            prompt = sft_format + self._processor.image_start_tag
 
-            # Tokenize prompt
-            input_ids = self._tokenizer.encode(prompt)
-            input_ids = torch.LongTensor(input_ids).unsqueeze(0).to(self._device)
+            # Prepare unconditional inputs (empty prompt, no image) for CFG
+            inputs_embeds_uncond, attention_mask_uncond = self._prepare_unconditional_inputs()
+
+            # Align sequence lengths via padding
+            inputs_embeds_cond, attention_mask_cond, inputs_embeds_uncond, attention_mask_uncond = (
+                self._align_embeddings_for_cfg(
+                    inputs_embeds_cond, attention_mask_cond,
+                    inputs_embeds_uncond, attention_mask_uncond
+                )
+            )
 
             # Generate image tokens using CFG
             with torch.no_grad():
-                generated_tokens = self._generate_image_tokens_with_cfg(input_ids)
+                generated_tokens = self._generate_image_tokens_with_cfg(
+                    inputs_embeds_cond, inputs_embeds_uncond,
+                    attention_mask_cond, attention_mask_uncond
+                )
 
-                if generated_tokens.shape[1] >= self.stage1_image_token_num_per_image:
-                    # Decode image from tokens
-                    gen_img_tensor = generated_tokens[
-                        :, : self.stage1_image_token_num_per_image
-                    ]
+            # Decode tokens to image
+            if generated_tokens.shape[1] >= self.stage1_image_token_num_per_image:
+                eval_logger.info(f"Stage 1 - Decoding {generated_tokens.shape[1]} tokens to image for doc {doc_id}")
+                image_path = self._decode_and_save_image(
+                    generated_tokens, doc_id, task
+                )
+                eval_logger.info(f"Stage 1 - Generated image saved to: {image_path}")
 
-                    generated_image = self._model.gen_vision_model.decode_code(
-                        gen_img_tensor.to(dtype=torch.int),
-                        shape=[
-                            1,
-                            8,
-                            self.stage1_img_size // self.stage1_patch_size,
-                            self.stage1_img_size // self.stage1_patch_size,
-                        ],
-                    )
+                # Clean up
+                del generated_tokens
+                torch.cuda.empty_cache()
 
-                    # Convert to PIL Image
-                    generated_image = (
-                        generated_image[0].permute(1, 2, 0).cpu().float().numpy()
-                    )
-                    generated_image = (
-                        ((generated_image + 1) / 2 * 255).clip(0, 255).astype("uint8")
-                    )
-                    generated_image = Image.fromarray(generated_image)
-
-                    # Save generated image
-                    task_dir = os.path.join(self.generated_images_dir, task)
-                    os.makedirs(task_dir, exist_ok=True)
-                    image_path = os.path.join(task_dir, f"{doc_id}_gen.png")
-                    generated_image.save(image_path)
-
-                    eval_logger.info(f"Generated image saved to {image_path}")
-
-                    del generated_tokens, gen_img_tensor
-                    torch.cuda.empty_cache()
-
-                    return prompt, [image_path]
-                else:
-                    eval_logger.warning(
-                        f"Not enough image tokens generated: {generated_tokens.shape[1]}"
-                    )
-                    del generated_tokens
-                    torch.cuda.empty_cache()
-                    return prompt, []
+                return generation_prompt, [image_path]
+            else:
+                eval_logger.warning(f"Stage 1 - Insufficient tokens generated: {generated_tokens.shape[1]}")
+                return generation_prompt, []
 
         except Exception as e:
-            eval_logger.error(f"Stage 1 generation error: {e}")
-            import traceback
-
-            eval_logger.error(traceback.format_exc())
+            eval_logger.error(f"Stage 1 failed for doc {doc_id}: {e}")
             if self.fail_gracefully:
                 return "", []
-            raise
+            else:
+                raise
+            
+    def _prepare_conditional_inputs(
+        self, generation_prompt: str, original_image: Optional[Image.Image]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prepare conditional inputs for CFG (with image and prompt).
 
-    def _generate_image_tokens_with_cfg(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Generate image tokens using classifier-free guidance with KV cache optimization."""
-        # Create conditional and unconditional inputs
-        batch_size = input_ids.shape[0]
-        tokens = torch.zeros((batch_size * 2, input_ids.shape[1]), dtype=torch.long).to(
-            self._device
+        Args:
+            generation_prompt: Text prompt for generation
+            original_image: Original image to condition on (optional)
+
+        Returns:
+            Tuple of (inputs_embeds, attention_mask)
+        """
+        images = [original_image] if original_image else []
+        if images:
+            image_placeholders = "<image_placeholder>\n" * len(images)
+            user_content = image_placeholders + generation_prompt
+        else:
+            user_content = generation_prompt
+
+        conversation = [
+            {"role": "User", "content": user_content, "images": images},
+            {"role": "Assistant", "content": ""},
+        ]
+
+        prepare_inputs = self._processor(
+            conversations=conversation,
+            images=images,
+            force_batchify=True,
+        ).to(self._device)
+
+        inputs_embeds = self._model.prepare_inputs_embeds(**prepare_inputs)
+        attention_mask = prepare_inputs.attention_mask
+
+        # Append image start token
+        inputs_embeds, attention_mask = self._append_image_start_token(
+            inputs_embeds, attention_mask
         )
-        tokens[0::2] = input_ids  # conditional
-        tokens[1::2] = input_ids.clone()
-        tokens[1::2, 1:-1] = self._processor.pad_id  # unconditional (mask content)
 
-        inputs_embeds = self._model.language_model.get_input_embeddings()(tokens)
+        return inputs_embeds, attention_mask
+
+    def _prepare_unconditional_inputs(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Prepare unconditional inputs for CFG (empty prompt, no image).
+
+        Returns:
+            Tuple of (inputs_embeds, attention_mask)
+        """
+        conversation = [
+            {"role": "User", "content": "", "images": []},
+            {"role": "Assistant", "content": ""},
+        ]
+
+        prepare_inputs = self._processor(
+            conversations=conversation,
+            images=[],
+            force_batchify=True,
+        ).to(self._device)
+
+        inputs_embeds = self._model.prepare_inputs_embeds(**prepare_inputs)
+        attention_mask = prepare_inputs.attention_mask
+
+        # Append image start token
+        inputs_embeds, attention_mask = self._append_image_start_token(
+            inputs_embeds, attention_mask
+        )
+
+        return inputs_embeds, attention_mask
+
+    def _append_image_start_token(
+        self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Append image start token to input embeddings.
+
+        Args:
+            inputs_embeds: Input embeddings [batch, seq, hidden]
+            attention_mask: Attention mask [batch, seq]
+
+        Returns:
+            Tuple of (updated_inputs_embeds, updated_attention_mask)
+        """
+        image_start_id = self._tokenizer.encode(
+            self._processor.image_start_tag, add_special_tokens=False
+        )[0]
+
+        start_emb = self._model.language_model.get_input_embeddings()(
+            torch.tensor([image_start_id], device=self._device)
+        ).unsqueeze(0)
+
+        inputs_embeds = torch.cat([inputs_embeds, start_emb], dim=1)
+        attention_mask = torch.cat([
+            attention_mask,
+            torch.ones((attention_mask.shape[0], 1), dtype=torch.long, device=self._device)
+        ], dim=1)
+
+        return inputs_embeds, attention_mask
+
+    def _align_embeddings_for_cfg(
+        self,
+        inputs_embeds_cond: torch.Tensor,
+        attention_mask_cond: torch.Tensor,
+        inputs_embeds_uncond: torch.Tensor,
+        attention_mask_uncond: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Align conditional and unconditional embeddings to same length via padding.
+
+        Args:
+            inputs_embeds_cond: Conditional embeddings
+            attention_mask_cond: Conditional attention mask
+            inputs_embeds_uncond: Unconditional embeddings
+            attention_mask_uncond: Unconditional attention mask
+
+        Returns:
+            Tuple of aligned (cond_embeds, cond_mask, uncond_embeds, uncond_mask)
+        """
+        diff = inputs_embeds_cond.shape[1] - inputs_embeds_uncond.shape[1]
+
+        if diff > 0:
+            # Pad unconditional inputs (left padding)
+            inputs_embeds_uncond, attention_mask_uncond = self._pad_embeddings(
+                inputs_embeds_uncond, attention_mask_uncond, diff
+            )
+        elif diff < 0:
+            # Pad conditional inputs (should rarely happen)
+            inputs_embeds_cond, attention_mask_cond = self._pad_embeddings(
+                inputs_embeds_cond, attention_mask_cond, abs(diff)
+            )
+
+        return inputs_embeds_cond, attention_mask_cond, inputs_embeds_uncond, attention_mask_uncond
+
+    def _pad_embeddings(
+        self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor, pad_length: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pad embeddings and attention mask on the left side.
+
+        Args:
+            inputs_embeds: Input embeddings [batch, seq, hidden]
+            attention_mask: Attention mask [batch, seq]
+            pad_length: Number of positions to pad
+
+        Returns:
+            Tuple of (padded_embeds, padded_mask)
+        """
+        pad_id = self._tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self._tokenizer.eos_token_id
+
+        pad_emb = self._model.language_model.get_input_embeddings()(
+            torch.tensor([pad_id], device=self._device)
+        ).unsqueeze(0)
+
+        pad_block = pad_emb.expand(1, pad_length, -1)
+        inputs_embeds = torch.cat([pad_block, inputs_embeds], dim=1)
+
+        pad_mask = torch.zeros((1, pad_length), dtype=torch.long, device=self._device)
+        attention_mask = torch.cat([pad_mask, attention_mask], dim=1)
+
+        return inputs_embeds, attention_mask
+
+    def _decode_and_save_image(
+        self, generated_tokens: torch.Tensor, doc_id: str, task: str
+    ) -> str:
+        """
+        Decode generated tokens to image and save to disk.
+
+        Args:
+            generated_tokens: Generated image tokens [batch, num_tokens]
+            doc_id: Document ID for file naming
+            task: Task name for directory structure
+
+        Returns:
+            Path to saved image file
+        """
+        gen_img_tensor = generated_tokens[:, : self.stage1_image_token_num_per_image]
+        eval_logger.debug(f"Decoding {gen_img_tensor.shape[1]} tokens to image")
+
+        generated_image = self._model.gen_vision_model.decode_code(
+            gen_img_tensor.to(dtype=torch.int),
+            shape=[
+                1,
+                8,
+                self.stage1_img_size // self.stage1_patch_size,
+                self.stage1_img_size // self.stage1_patch_size,
+            ],
+        )
+
+        generated_image = generated_image[0].permute(1, 2, 0).cpu().float().detach().numpy()
+        generated_image = ((generated_image + 1) / 2 * 255).clip(0, 255).astype("uint8")
+        eval_logger.debug(f"Image decoded with shape: {generated_image.shape}")
+
+        generated_image = Image.fromarray(generated_image)
+
+        task_dir = os.path.join(self.generated_images_dir, task)
+        os.makedirs(task_dir, exist_ok=True)
+        image_path = os.path.join(task_dir, f"{doc_id}_gen.png")
+        generated_image.save(image_path)
+        eval_logger.info(f"Saved generated image: {image_path}")
+
+        return image_path
+
+    def _generate_image_tokens_with_cfg(
+        self, 
+        inputs_embeds_cond: torch.Tensor, 
+        inputs_embeds_uncond: torch.Tensor,
+        attention_mask_cond: torch.Tensor,
+        attention_mask_uncond: torch.Tensor
+    ) -> torch.Tensor:
+        """Generate image tokens using classifier-free guidance with KV cache optimization.
+
+        Args:
+            inputs_embeds_cond: Conditional input embeddings (with images)
+            inputs_embeds_uncond: Unconditional input embeddings (without images)
+            attention_mask_cond: Attention mask for conditional inputs
+            attention_mask_uncond: Attention mask for unconditional inputs
+        """
+        batch_size = inputs_embeds_cond.shape[0]
+
+        # Combine conditional and unconditional embeddings
+        # Shape: [batch_size * 2, seq_len, hidden_dim]
+        inputs_embeds = torch.cat([inputs_embeds_cond, inputs_embeds_uncond], dim=0)
+        
+        # Combine attention masks
+        # Shape: [batch_size * 2, seq_len]
+        attention_mask = torch.cat([attention_mask_cond, attention_mask_uncond], dim=0)
 
         generated_tokens = torch.zeros(
             (batch_size, self.stage1_image_token_num_per_image), dtype=torch.long
@@ -396,12 +588,22 @@ class JanusProVisualCoT(lmms):
                 # First iteration: process full sequence
                 model_outputs = self._model.language_model.model(
                     inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,  # Pass concatenated mask
                     use_cache=True,
                 )
             else:
                 # Subsequent iterations: only process last token
+                # Update mask: Append 1s for the new token
+                new_mask = torch.ones(
+                    (attention_mask.shape[0], 1), 
+                    dtype=attention_mask.dtype, 
+                    device=attention_mask.device
+                )
+                attention_mask = torch.cat([attention_mask, new_mask], dim=1)
+
                 model_outputs = self._model.language_model.model(
                     inputs_embeds=inputs_embeds[:, -1:, :],
+                    attention_mask=attention_mask, # Pass updated mask
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
@@ -410,8 +612,9 @@ class JanusProVisualCoT(lmms):
             past_key_values = model_outputs.past_key_values
 
             logits = self._model.gen_head(hidden_states[:, -1, :])
-            logit_cond = logits[0::2, :]
-            logit_uncond = logits[1::2, :]
+            # Split conditional and unconditional logits
+            logit_cond = logits[:batch_size, :]
+            logit_uncond = logits[batch_size:, :]
 
             # Apply CFG
             logits = logit_uncond + self.stage1_cfg_weight * (logit_cond - logit_uncond)
@@ -655,13 +858,21 @@ class JanusProVisualCoT(lmms):
             if task_type == "maze":
                 # Get step count from ground truth
                 steps_str = doc.get("steps", "[]")
-                steps = json_module.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                steps = (
+                    json_module.loads(steps_str)
+                    if isinstance(steps_str, str)
+                    else steps_str
+                )
                 if steps:
                     num_images = len(steps)
             elif task_type == "sliding":
                 # Get step count from ground truth
                 steps_str = doc.get("steps_words", "[]")
-                steps = json_module.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                steps = (
+                    json_module.loads(steps_str)
+                    if isinstance(steps_str, str)
+                    else steps_str
+                )
                 if steps:
                     num_images = len(steps)
 
@@ -770,9 +981,9 @@ class JanusProVisualCoT(lmms):
             for i in range(1, num_images + 1):
                 # Generate step image with planning prompt
                 if task_type == "maze":
-                    plan_suffix = f'Step {i}: Generate an image showing the next move (one step up/down/left/right).'
+                    plan_suffix = f"Step {i}: Generate an image showing the next move (one step up/down/left/right)."
                 else:  # sliding
-                    plan_suffix = f'Step {i}: Generate an image showing which tile to move and in which direction.'
+                    plan_suffix = f"Step {i}: Generate an image showing which tile to move and in which direction."
 
                 gen_prompt = prompt + "\n\n" + plan_suffix
 
