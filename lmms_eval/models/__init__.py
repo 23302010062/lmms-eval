@@ -51,6 +51,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "minicpm_v": "MiniCPM_V",
     "minimonkey": "MiniMonkey",
     "mmada": "MMaDA",
+    "MMaDA": "MMaDA",
     "moviechat": "MovieChat",
     "mplug_owl_video": "mplug_Owl",
     "nano_banana": "NanoBanana",

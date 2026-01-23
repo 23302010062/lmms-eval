@@ -1,507 +1,577 @@
-"""
-MMaDA (Multimodal Diffusion Language Model) Integration
-
-MMaDA is a unified diffusion foundation model for text generation, image generation,
-and multimodal understanding.
-
-Usage:
-    python -m lmms_eval \
-        --model mmada \
-        --model_args pretrained=/scratch/models/MMaDA-8B-MixCoT \
-        --tasks chartqa100 \
-        --batch_size 1 \
-        --device cuda:0 \
-        --output_path ./logs/
-"""
+# coding=utf-8
+# Copyright 2025 Gen-Verse.
+#
+# Licensed under the MIT License
 
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+from accelerate import Accelerator
 from loguru import logger as eval_logger
 from PIL import Image
 from tqdm import tqdm
-from torchvision import transforms
 
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
-from lmms_eval import utils
 
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-def add_gumbel_noise(logits, temperature):
-    """
-    The Gumbel max is a method for sampling categorical distributions.
-    According to arXiv:2409.02908, for MDM, low-precision Gumbel Max improves perplexity score but reduces generation quality.
-    Modified to work in-place with original dtype to minimize memory usage.
-    """
-    if temperature == 0:
-        return logits
-    # Work directly with the original dtype to avoid memory overhead from conversion
-    # Generate noise in the same dtype as logits
-    noise = torch.rand_like(logits)
-    # Compute gumbel noise: (-log(noise))^temperature
-    gumbel_noise = (-torch.log(noise)) ** temperature
-    # Return logits.exp() / gumbel_noise
-    # Use in-place operations where possible to save memory
-    result = logits.exp()
-    result.div_(gumbel_noise)
-    return result
-
-
-def get_num_transfer_tokens(mask_index, steps):
-    """
-    In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
-    Furthermore, because LLaDA employs a linear noise schedule (as defined in Eq. (8)),
-    the expected number of tokens transitioned at each step should be consistent.
-
-    This function is designed to precompute the number of tokens that need to be transitioned at each step.
-    """
-    mask_num = mask_index.sum(dim=1, keepdim=True)
-
-    base = mask_num // steps
-    remainder = mask_num % steps
-
-    num_transfer_tokens = torch.zeros(mask_num.size(0), steps, device=mask_index.device, dtype=torch.int64) + base
-
-    for i in range(mask_num.size(0)):
-        num_transfer_tokens[i, : remainder[i]] += 1
-
-    return num_transfer_tokens
-
-
-@torch.no_grad()
-def generate(
-    model,
-    prompt,
-    steps=128,
-    gen_length=128,
-    block_length=128,
-    temperature=0.0,
-    cfg_scale=0.0,
-    remasking="low_confidence",
-    mask_id=126336,
-    attention_mask=None,
-):
-    """
-    Args:
-        model: Mask predictor.
-        prompt: A tensor of shape (B, L), where B is batch size.
-        steps: Sampling steps, less than or equal to gen_length.
-        gen_length: Generated answer length.
-        block_length: Block length, less than or equal to gen_length. If less than gen_length, it means using semi_autoregressive remasking.
-        temperature: Categorical distribution sampling temperature.
-        cfg_scale: Unsupervised classifier-free guidance scale.
-        remasking: Remasking strategy. 'low_confidence' or 'random'.
-        mask_id: The token id of [MASK] is 126336.
-    """
-    if attention_mask is not None and 0.0 in attention_mask:
-        attention_bias = (attention_mask[:, :, None] & attention_mask[:, None, :]).bool().unsqueeze(1)
-    else:
-        attention_bias = None
-    batch_size = prompt.shape[0]
-    x = torch.full((batch_size, prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
-    x[:, : prompt.shape[1]] = prompt.clone()
-
-    prompt_index = x != mask_id
-
-    assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
-    num_blocks = gen_length // block_length
-
-    # Ensure steps is at least num_blocks so each block gets at least 1 step
-    steps = max(num_blocks, steps)
-    # Adjust steps to be divisible by num_blocks
-    steps = (steps // num_blocks) * num_blocks
-    steps_per_block = steps // num_blocks
-
-    for num_block in range(num_blocks):
-        block_mask_index = x[:, prompt.shape[1] + num_block * block_length : prompt.shape[1] + (num_block + 1) * block_length :] == mask_id
-        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
-        for i in range(steps_per_block):
-            mask_index = x == mask_id
-            if cfg_scale > 0.0:
-                un_x = x.clone()
-                un_x[prompt_index] = mask_id
-                x_ = torch.cat([x, un_x], dim=0)
-                logits = model(x_).logits
-                logits, un_logits = torch.chunk(logits, 2, dim=0)
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-            else:
-                logits = model(x, attention_bias=attention_bias).logits
-
-            # Get argmax directly without adding noise if temperature is 0
-            if temperature == 0:
-                x0 = torch.argmax(logits, dim=-1)  # b, l
-            else:
-                logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1)  # b, l
-                del logits_with_noise
-
-            if remasking == "low_confidence":
-                # Use original dtype to avoid memory overhead
-                p = F.softmax(logits, dim=-1)
-                x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)  # b, l
-                del p
-            elif remasking == "random":
-                x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
-            else:
-                raise NotImplementedError(remasking)
-
-            # Free logits memory
-            del logits
-
-            x0_p[:, prompt.shape[1] + (num_block + 1) * block_length :] = -np.inf
-
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(mask_index, x0_p, -np.inf)
-            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
-            for j in range(confidence.shape[0]):
-                _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
-                transfer_index[j, select_index] = True
-            x[transfer_index] = x0[transfer_index]
-
-    return x
-
-
-def image_transform(image, resolution=512, normalize=True):
-    """Transform image for MMaDA"""
-    image = transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BICUBIC)(image)
-    image = transforms.CenterCrop((resolution, resolution))(image)
-    image = transforms.ToTensor()(image)
-    if normalize:
-        image = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)(image)
-    return image
+# Add MMaDA repository to Python path
+# Expected: lmms-eval/MMaDA/ directory at project root
+wd = Path(__file__).parent.parent.parent.parent.resolve()
+mmada_path = os.path.join(str(wd), "MMaDA")
+if os.path.exists(mmada_path):
+    sys.path.insert(0, mmada_path)
+    eval_logger.info(f"Added MMaDA path to sys.path: {mmada_path}")
+else:
+    eval_logger.warning(
+        f"MMaDA repository not found at {mmada_path}. "
+        f"Please clone it: cd {wd} && git clone https://github.com/Gen-Verse/MMaDA.git"
+    )
 
 
 @register_model("mmada")
 class MMaDA(lmms):
     """
-    MMaDA: Multimodal Diffusion Language Model
+    MMaDA: Multimodal Large Diffusion Language Model
 
-    A unified diffusion foundation model for text generation, image generation,
-    and multimodal understanding.
+    A unified diffusion foundation model supporting:
+    - Text generation (semi-autoregressive)
+    - Multimodal understanding
+    - Text-to-image generation (non-autoregressive diffusion)
+    - Image captioning
+    - Complex reasoning tasks
+
+    Model: Gen-Verse/MMaDA-8B-MixCoT (default)
+    Paper: https://arxiv.org/abs/2505.15809
+    GitHub: https://github.com/Gen-Verse/MMaDA
+
+    Example usage for understanding:
+    python -m lmms_eval \\
+        --model mmada \\
+        --model_args pretrained=Gen-Verse/MMaDA-8B-MixCoT,mode=understanding \\
+        --tasks mmbench \\
+        --batch_size 1 \\
+        --output_path ./logs/
+
+    Example usage for generation:
+    python -m lmms_eval \\
+        --model mmada \\
+        --model_args pretrained=Gen-Verse/MMaDA-8B-MixCoT,mode=generation \\
+        --tasks geneval \\
+        --batch_size 1 \\
+        --output_path ./logs/
     """
 
     def __init__(
         self,
-        pretrained: str = "/scratch/models/MMaDA-8B-MixCoT",
-        vq_model_path: str = "/scratch/models/magvitv2",
-        # Generation parameters
+        pretrained: str = "Gen-Verse/MMaDA-8B-MixCoT",
+        mode: str = "understanding",
+        weight_type: str = "bfloat16",
+        output_image_dir: Optional[str] = None,
+        guidance_scale: float = 3.5,
+        generation_timesteps: int = 15,
         max_new_tokens: int = 512,
-        steps: int = 64,
-        block_length: int = 64,
         temperature: float = 1.0,
-        cfg_scale: float = 0.0,
-        remasking: str = "low_confidence",
-        # Image processing
-        image_resolution: int = 128,  # Reduced from 256 to 128 to save memory
-        # Model loading
-        load_in_4bit: bool = False,
-        load_in_8bit: bool = False,
-        device: str = "cuda",
-        device_map: str = "auto",  # Use "auto" for multi-GPU model parallel
-        batch_size: int = 1,
-        # Output
-        output_dir: Optional[str] = None,
+        seed: int = 0,
+        continual_mode: bool = True,
+        response_persistent_folder: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
 
+        if mode not in ["understanding", "generation"]:
+            raise ValueError(
+                f"mode must be 'understanding' or 'generation', got '{mode}'"
+            )
+
+        self.mode = mode
         self.pretrained = pretrained
-        self.vq_model_path = vq_model_path
         self.max_new_tokens = max_new_tokens
-        self.steps = steps
-        self.block_length = block_length
         self.temperature = temperature
-        self.cfg_scale = cfg_scale
-        self.remasking = remasking
-        self.image_resolution = image_resolution
-        self.device_str = device
-        self.device_map = device_map
-        self.batch_size_per_gpu = batch_size
-        self.mask_id = 126336  # MMaDA's mask token ID
+        self.guidance_scale = guidance_scale
+        self.generation_timesteps = generation_timesteps
+        self.seed = seed
+        self.continual_mode = continual_mode
+
+        # Set weight type
+        if weight_type == "bfloat16":
+            self.weight_type = torch.bfloat16
+        elif weight_type == "float16":
+            self.weight_type = torch.float16
+        else:
+            self.weight_type = torch.float32
 
         # Setup output directory
-        if output_dir is None:
-            self.output_dir = "./logs/mmada"
+        if response_persistent_folder is None:
+            self.response_persistent_folder = "./logs/mmada_persistent_folder"
         else:
-            self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
+            self.response_persistent_folder = response_persistent_folder
+
+        if output_image_dir is None:
+            self.output_image_dir = os.path.join(
+                self.response_persistent_folder, "mmada_generated_images"
+            )
+        else:
+            self.output_image_dir = output_image_dir
+
+        os.makedirs(self.output_image_dir, exist_ok=True)
+        eval_logger.info(f"Image output directory: {self.output_image_dir}")
+
+        # Setup response cache for continual mode
+        self.response_cache = {}
+        self.cache_mode = "start"
+
+        if self.continual_mode:
+            os.makedirs(self.response_persistent_folder, exist_ok=True)
+            self.response_persistent_file = os.path.join(
+                self.response_persistent_folder, "mmada_response.json"
+            )
+
+            if os.path.exists(self.response_persistent_file):
+                with open(self.response_persistent_file, "r") as f:
+                    self.response_cache = json.load(f)
+                self.cache_mode = "resume"
+                eval_logger.info(f"Loaded cache: {len(self.response_cache)} records")
+
+        # Setup accelerator
+        accelerator = Accelerator()
+        if accelerator.num_processes > 1:
+            if self.continual_mode:
+                eval_logger.warning(
+                    "Continual mode is not supported for distributed inference. "
+                    "Automatically disabling continual_mode."
+                )
+                self.continual_mode = False
+            self.accelerator = accelerator
+            self._rank = self.accelerator.local_process_index
+            self._world_size = self.accelerator.num_processes
+        else:
+            self.accelerator = accelerator
+            self._rank = 0
+            self._world_size = 1
 
         # Load model
         eval_logger.info(f"Loading MMaDA model from {pretrained}")
-        self._load_model(load_in_4bit, load_in_8bit)
+        self._load_model()
+        eval_logger.info("MMaDA model initialized successfully")
 
-        eval_logger.info("MMaDA initialized successfully")
+    def _load_model(self):
+        """Load MMaDA model components"""
+        try:
+            from transformers import AutoTokenizer
+            from models import MAGVITv2, MMadaModelLM
+            from training.prompting_utils import UniversalPrompting
+            from training.utils import image_transform, image_transform_squash
 
-    def _load_model(self, load_in_4bit: bool, load_in_8bit: bool):
-        """Load MMaDA model and VQ model"""
-        from transformers import AutoTokenizer
+            # Use accelerator's device for proper distributed inference
+            self.device = self.accelerator.device
+            eval_logger.info(
+                f"Using device: {self.device} "
+                f"(rank {self._rank}/{self._world_size})"
+            )
 
-        # Add MMaDA models directory to Python path
-        mmada_repo_path = "/scratch/models/MMaDA"
-        if mmada_repo_path not in sys.path:
-            sys.path.insert(0, mmada_repo_path)
+            # Load tokenizer
+            eval_logger.info("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.pretrained, padding_side="left", trust_remote_code=True
+            )
 
-        # Import MMaDA models
-        from models import MMadaModelLM, MAGVITv2
+            # Setup universal prompting
+            self.uni_prompting = UniversalPrompting(
+                self.tokenizer,
+                max_text_len=512,  # Default max sequence length
+                special_tokens=(
+                    "<|soi|>",
+                    "<|eoi|>",
+                    "<|sov|>",
+                    "<|eov|>",
+                    "<|t2i|>",
+                    "<|mmu|>",
+                    "<|t2v|>",
+                    "<|v2v|>",
+                    "<|lvg|>",
+                ),
+                ignore_id=-100,
+                cond_dropout_prob=0.0,
+                use_reserved_token=True,
+            )
 
-        # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(self.pretrained, trust_remote_code=True)
+            # Load VQ model (MAGVITv2)
+            eval_logger.info("Loading VQ model...")
+            self.vq_model = MAGVITv2.from_pretrained("showlab/magvitv2").to(
+                self.device
+            )
+            self.vq_model.eval()
+            self.vq_model.requires_grad_(False)
 
-        # Set chat template
-        self.tokenizer.chat_template = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{{ '<|start_header_id|>assistant<|end_header_id|>\n' }}"
-
-        # Setup special tokens with reserved IDs (from MMaDA's prompting_utils.py)
-        self.special_tokens = {
-            "<|soi|>": 126084,
-            "<|eoi|>": 126085,
-            "<|sov|>": 126086,
-            "<|eov|>": 126087,
-            "<|t2i|>": 126088,
-            "<|mmu|>": 126089,
-            "<|t2v|>": 126090,
-            "<|v2v|>": 126091,
-            "<|lvg|>": 126092,
-        }
-
-        dtype = torch.bfloat16
-        if load_in_4bit or load_in_8bit:
-            eval_logger.warning("4-bit/8-bit quantization not yet supported for MMaDA, loading in bfloat16")
-
-        # Load VQ model on GPU (will use first available GPU)
-        eval_logger.info(f"Loading VQ model from {self.vq_model_path}")
-        vq_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.vq_model = MAGVITv2.from_pretrained(
-            self.vq_model_path,
-            low_cpu_mem_usage=False
-        ).to(vq_device)
-        self.vq_model.eval()
-        self.vq_model.requires_grad_(False)
-        eval_logger.info(f"VQ model loaded successfully on {vq_device}")
-
-        # Load MMaDA model with device_map for multi-GPU
-        eval_logger.info(f"Loading MMaDA model from {self.pretrained} with device_map={self.device_map}")
-
-        if self.device_map == "auto":
-            # Auto device map will distribute model across available GPUs
+            # Load MMaDA model
+            eval_logger.info("Loading MMaDA model...")
             self.model = MMadaModelLM.from_pretrained(
                 self.pretrained,
                 trust_remote_code=True,
-                torch_dtype=dtype,
-                device_map="auto",
-                max_memory={0: "38GB", 1: "38GB"}  # Reserve some memory on each GPU
-            ).eval()
-            eval_logger.info(f"Model loaded with automatic device mapping across GPUs")
-        else:
-            # Single device
-            device = torch.device(self.device_str if torch.cuda.is_available() else "cpu")
-            self.model = MMadaModelLM.from_pretrained(
-                self.pretrained,
-                trust_remote_code=True,
-                torch_dtype=dtype
-            ).to(device).eval()
-            eval_logger.info(f"Model loaded on {device} with dtype {dtype}")
+                torch_dtype=self.weight_type,
+            ).to(self.device)
+            self.model.eval()
+
+            # Store image transform functions
+            self.image_transform = image_transform
+            self.image_transform_squash = image_transform_squash
+
+            eval_logger.info("Model loaded successfully")
+
+        except ImportError as e:
+            raise ImportError(
+                f"Failed to import MMaDA dependencies. "
+                f"Please ensure:\n"
+                f"  1. MMaDA repository is cloned at lmms-eval root\n"
+                f"  2. Required dependencies are installed\n"
+                f"Error: {e}"
+            )
 
     @property
-    def batch_size(self):
-        return self.batch_size_per_gpu
+    def rank(self):
+        return self._rank
 
-    def flatten(self, input):
-        """Flatten nested lists"""
-        new_list = []
-        for i in input:
-            for j in i:
-                new_list.append(j)
-        return new_list
+    @property
+    def world_size(self):
+        return self._world_size
+
+    def set_seed(self, seed: int):
+        """Set random seeds for reproducibility"""
+        if seed > 0:
+            import random
+
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+                torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+    def understand_image(self, prompt: str, image: Image.Image, doc_id: str) -> str:
+        """
+        Understand image and answer question
+
+        Args:
+            prompt: Input text prompt/question
+            image: PIL Image to understand
+            doc_id: Document ID for logging
+
+        Returns:
+            Generated text answer
+        """
+        self.set_seed(self.seed)
+
+        try:
+            # Transform image to tensor
+            # Use squash transform for certain datasets, regular transform otherwise
+            if any(
+                tag in str(doc_id)
+                for tag in ["ai2d", "clevr", "docvqa", "geo", "llava"]
+            ):
+                image_tensor = self.image_transform_squash(
+                    image, resolution=512
+                ).to(self.device)
+            else:
+                image_tensor = self.image_transform(
+                    image, resolution=512
+                ).to(self.device)
+
+            image_tensor = image_tensor.unsqueeze(0)
+
+            # Get image tokens from VQ model
+            image_tokens = self.vq_model.get_code(image_tensor) + len(
+                self.uni_prompting.text_tokenizer
+            )
+
+            # Prepare text input using chat template
+            messages = [{"role": "user", "content": prompt}]
+            text_token_ids = self.uni_prompting.text_tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(self.device)
+
+            # Construct input_ids with special tokens
+            batch_size = image_tokens.shape[0]
+            input_ids = torch.cat(
+                [
+                    (
+                        torch.ones(batch_size, 1)
+                        * self.uni_prompting.sptids_dict["<|mmu|>"]
+                    ).to(self.device),
+                    (
+                        torch.ones(batch_size, 1)
+                        * self.uni_prompting.sptids_dict["<|soi|>"]
+                    ).to(self.device),
+                    image_tokens,
+                    (
+                        torch.ones(batch_size, 1)
+                        * self.uni_prompting.sptids_dict["<|eoi|>"]
+                    ).to(self.device),
+                    text_token_ids,
+                ],
+                dim=1,
+            ).long()
+
+            # Generate response
+            # For understanding tasks, use optimized step count
+            # Balance between speed and quality
+            gen_max_tokens = self.max_new_tokens
+            gen_steps = 16  # Optimized: 16 steps for good speed/quality balance
+            gen_block_length = min(gen_max_tokens, 128)  # Reasonable block size
+
+            with torch.no_grad():
+                if self.device.type == "cuda":
+                    with torch.autocast("cuda", dtype=self.weight_type):
+                        output_ids = self.model.mmu_generate(
+                            input_ids,
+                            max_new_tokens=gen_max_tokens,
+                            steps=gen_steps,
+                            block_length=gen_block_length,
+                        )
+                else:
+                    output_ids = self.model.mmu_generate(
+                        input_ids,
+                        max_new_tokens=gen_max_tokens,
+                        steps=gen_steps,
+                        block_length=gen_block_length,
+                    )
+
+            # Decode generated tokens
+            generated_ids = output_ids[:, input_ids.shape[1] :]
+            response_text = self.uni_prompting.text_tokenizer.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
+
+            return response_text
+
+        except Exception as e:
+            eval_logger.error(f"Error in understand_image for doc_id={doc_id}: {e}")
+            return ""
+
+    def generate_text_and_image(
+        self, prompt: str, doc_id: str, task: str
+    ) -> Tuple[str, List[str]]:
+        """
+        Generate text and image from prompt
+
+        Args:
+            prompt: Input text prompt
+            doc_id: Document ID for file naming
+            task: Task name for file naming
+
+        Returns:
+            Tuple of (generated_text, list_of_image_paths)
+        """
+        self.set_seed(self.seed)
+
+        try:
+            # Import generate function from MMaDA
+            from generate import generate
+
+            # Prepare text input using chat template
+            messages = [{"role": "user", "content": prompt}]
+            text_token_ids = self.uni_prompting.text_tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(self.device)
+
+            # Add t2i special token for text-to-image generation
+            batch_size = text_token_ids.shape[0]
+            input_ids = torch.cat(
+                [
+                    (
+                        torch.ones(batch_size, 1)
+                        * self.uni_prompting.sptids_dict["<|t2i|>"]
+                    ).to(self.device),
+                    text_token_ids,
+                ],
+                dim=1,
+            ).long()
+
+            # Generate image tokens using diffusion
+            with torch.no_grad():
+                # Calculate generation parameters
+                # Image tokens are typically 256 or 1024 depending on resolution
+                gen_length = 256  # For 16x16 image tokens
+                steps = self.generation_timesteps
+                block_length = gen_length  # Non-autoregressive for images
+
+                output_ids = generate(
+                    self.model,
+                    input_ids,
+                    steps=steps,
+                    gen_length=gen_length,
+                    block_length=block_length,
+                    temperature=self.temperature,
+                    cfg_scale=self.guidance_scale,
+                    remasking="low_confidence",
+                    mask_id=self.tokenizer.mask_token_id,
+                )
+
+                # Extract generated image tokens
+                generated_ids = output_ids[:, input_ids.shape[1] :]
+
+                # Decode image tokens to image
+                # Subtract offset to get VQ codes
+                image_codes = generated_ids - len(self.uni_prompting.text_tokenizer)
+
+                # Reshape to 2D grid (assuming 16x16)
+                h = w = 16
+                image_codes = image_codes.reshape(batch_size, h, w)
+
+                # Decode using VQ model
+                generated_image = self.vq_model.decode_code(image_codes)
+
+                # Convert to PIL Image and save
+                generated_image = torch.clamp(
+                    (generated_image + 1.0) / 2.0, min=0.0, max=1.0
+                )
+                generated_image = (
+                    generated_image.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
+                )
+                generated_image = generated_image.astype(np.uint8)
+                pil_image = Image.fromarray(generated_image)
+
+                # Save image
+                image_filename = f"{task}_{doc_id}.png"
+                image_path = os.path.join(self.output_image_dir, image_filename)
+                pil_image.save(image_path)
+
+                output_text = f"Generated image for prompt: {prompt}"
+                output_images = [image_path]
+
+            return output_text, output_images
+
+        except Exception as e:
+            eval_logger.error(
+                f"Error in generate_text_and_image for doc_id={doc_id}: {e}"
+            )
+            return "", []
+
+    def format_output(self, text: str, images: List[str]) -> str:
+        """Format output as JSON string"""
+        output_dict = {"text": text, "images": images}
+        return json.dumps(output_dict, ensure_ascii=False)
+
+    def flatten(self, input_list):
+        """Flatten a nested list"""
+        output = []
+        for item in input_list:
+            if isinstance(item, list):
+                output.extend(self.flatten(item))
+            else:
+                output.append(item)
+        return output
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
-        """Generate responses for a list of requests"""
+        """Main inference method"""
         res = []
-
-        def _collate(x):
-            toks = self.tokenizer.encode(x[0])
-            return -len(toks), x[0]
-
         pbar = tqdm(
             total=len(requests),
-            desc="Generating with MMaDA",
+            disable=(self.rank != 0),
+            desc="MMaDA Generating",
         )
 
-        # Group requests by generation kwargs
-        re_ords = utils.Collator(
-            [reg.args for reg in requests], _collate, grouping=True
-        )
-        chunks = re_ords.get_batched(n=self.batch_size, batch_fn=None)
+        def get_uuid(task, split, doc_id):
+            return f"{task}___{split}___{doc_id}"
 
-        for chunk in chunks:
-            (
-                contexts,
-                all_gen_kwargs,
-                doc_to_visual,
-                doc_id,
-                task,
-                split,
-            ) = zip(*chunk)
+        for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [
+            reg.args for reg in requests
+        ]:
+            doc_uuid = get_uuid(task, split, doc_id)
 
-            task = task[0]
-            split = split[0]
+            # Check cache
+            if self.continual_mode and self.cache_mode == "resume":
+                if doc_uuid in self.response_cache:
+                    content = self.response_cache[doc_uuid]
+                    if content:
+                        res.append(content)
+                        pbar.update(1)
+                        continue
 
-            # Get visuals
-            visuals = [
-                doc_to_visual[0](self.task_dict[task][split][ids]) for ids in doc_id
-            ]
-            visuals = self.flatten(visuals)
+            prompt = contexts
 
-            # Get generation kwargs
-            gen_kwargs = all_gen_kwargs[0]
+            if self.mode == "understanding":
+                # Image understanding mode
+                if doc_to_visual is None:
+                    eval_logger.warning(
+                        f"No visual provided for understanding mode, doc_id={doc_id}"
+                    )
+                    res.append("")
+                    pbar.update(1)
+                    continue
 
-            # Process each context
-            if isinstance(contexts, tuple):
-                contexts = list(contexts)
+                # Get visuals from doc_to_visual
+                visuals = [doc_to_visual(self.task_dict[task][split][doc_id])]
+                visuals = self.flatten(visuals)
 
-            # Handle batch processing
-            for i, context in enumerate(contexts):
-                # Get images for this context
-                # Note: visuals are already flattened, so we take all of them for this single context
-                images = []
-                for visual in visuals:
-                    if isinstance(visual, str):
-                        visual = Image.open(visual).convert("RGB")
-                    elif isinstance(visual, Image.Image):
-                        visual = visual.convert("RGB")
-                    images.append(visual)
+                if not visuals or len(visuals) == 0:
+                    eval_logger.warning(f"No visual data found for doc_id={doc_id}")
+                    res.append("")
+                    pbar.update(1)
+                    continue
 
-                # Generate response
-                if len(images) > 0:
-                    # Multimodal generation
-                    response = self._generate_multimodal(context, images, gen_kwargs)
-                else:
-                    # Text-only generation
-                    response = self._generate_text_only(context, gen_kwargs)
+                # Use first image for understanding
+                image = visuals[0]
+                if isinstance(image, str):
+                    image = Image.open(image).convert("RGB")
+                elif not isinstance(image, Image.Image):
+                    eval_logger.warning(
+                        f"Unsupported visual type: {type(image)} for doc_id={doc_id}"
+                    )
+                    res.append("")
+                    pbar.update(1)
+                    continue
 
-                res.append(response)
-                pbar.update(1)
+                output_text = self.understand_image(prompt, image, str(doc_id))
+                formatted_output = output_text
+
+            else:
+                # Image generation mode
+                output_text, output_images = self.generate_text_and_image(
+                    prompt, str(doc_id), task
+                )
+                formatted_output = self.format_output(output_text, output_images)
+
+            res.append(formatted_output)
+
+            # Update cache
+            if self.continual_mode:
+                self.response_cache[doc_uuid] = formatted_output
+                with open(self.response_persistent_file, "w") as f:
+                    json.dump(self.response_cache, f, ensure_ascii=False, indent=2)
+
+            pbar.update(1)
 
         pbar.close()
         return res
 
-    def _generate_text_only(self, context: str, gen_kwargs: dict) -> str:
-        """Generate text-only response"""
-        # Prepare prompt
-        messages = [{"role": "user", "content": context}]
-        prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        input_ids = self.tokenizer(text=prompt, return_tensors="pt", padding=True, padding_side="left")["input_ids"]
-        input_ids = input_ids.to(self.model.device)
-
-        # Get generation parameters
-        max_new_tokens = gen_kwargs.get("max_new_tokens", self.max_new_tokens)
-        steps = min(self.steps, max_new_tokens)
-        block_length = min(self.block_length, max_new_tokens)
-
-        # Generate
-        output = generate(
-            self.model,
-            input_ids,
-            steps=steps,
-            gen_length=max_new_tokens,
-            block_length=block_length,
-            temperature=self.temperature,
-            cfg_scale=self.cfg_scale,
-            remasking=self.remasking,
-            mask_id=self.mask_id,
-        )
-
-        # Decode
-        generated_text = self.tokenizer.batch_decode(output[:, input_ids.shape[1] :], skip_special_tokens=True)[0]
-        return generated_text
-
-    def _generate_multimodal(self, context: str, images: List[Image.Image], gen_kwargs: dict) -> str:
-        """Generate multimodal response"""
-        # Get the device of the first model parameter
-        device = next(self.model.parameters()).device
-
-        # Process images with VQ model on GPU
-        image_tokens_list = []
-        for img in images:
-            img_tensor = image_transform(img, resolution=self.image_resolution, normalize=True)
-            img_tensor = img_tensor.unsqueeze(0).to(self.vq_model.device)
-
-            # Get image tokens from VQ model
-            with torch.no_grad():
-                img_tokens = self.vq_model.get_code(img_tensor) + len(self.tokenizer)
-
-            # Move tokens to main model's device
-            img_tokens = img_tokens.to(device)
-            image_tokens_list.append(img_tokens)
-
-        # Concatenate all image tokens
-        if len(image_tokens_list) > 0:
-            image_tokens = torch.cat(image_tokens_list, dim=1)
-        else:
-            image_tokens = None
-
-        # Prepare text
-        messages = [{"role": "user", "content": context}]
-        text_token_ids = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to(device)
-
-        # Assemble input: <|mmu|> <|soi|> image_tokens <|eoi|> text_tokens
-        batch_size = 1
-        input_ids_list = [
-            torch.ones(batch_size, 1, dtype=torch.long, device=device) * self.special_tokens["<|mmu|>"],
-        ]
-
-        if image_tokens is not None:
-            input_ids_list.append(torch.ones(batch_size, 1, dtype=torch.long, device=device) * self.special_tokens["<|soi|>"])
-            input_ids_list.append(image_tokens)
-            input_ids_list.append(torch.ones(batch_size, 1, dtype=torch.long, device=device) * self.special_tokens["<|eoi|>"])
-
-        input_ids_list.append(text_token_ids)
-        input_ids = torch.cat(input_ids_list, dim=1).long()
-
-        # Get generation parameters
-        max_new_tokens = gen_kwargs.get("max_new_tokens", self.max_new_tokens)
-        steps = min(self.steps, max_new_tokens)
-        block_length = min(self.block_length, max_new_tokens)
-
-        # Generate
-        output = generate(
-            self.model,
-            input_ids,
-            steps=steps,
-            gen_length=max_new_tokens,
-            block_length=block_length,
-            temperature=self.temperature,
-            cfg_scale=self.cfg_scale,
-            remasking=self.remasking,
-            mask_id=self.mask_id,
-        )
-
-        # Decode
-        generated_ids = output[:, input_ids.shape[1]:]
-        eval_logger.debug(f"Generated IDs shape: {generated_ids.shape}")
-        eval_logger.debug(f"Generated IDs (first 20): {generated_ids[0, :20].tolist()}")
-        eval_logger.debug(f"Mask ID: {self.mask_id}")
-        generated_text = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        eval_logger.debug(f"Generated text: '{generated_text}'")
-        return generated_text
-
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        """Calculate log-likelihood for requests"""
-        eval_logger.warning("loglikelihood not implemented for MMaDA, returning dummy values")
-        return [(0.0, False) for _ in requests]
+        """Not supported for generation models"""
+        raise NotImplementedError(
+            "MMaDA is a generation model and does not support loglikelihood"
+        )
 
-    def generate_until_multi_round(self, requests: List[Instance]) -> List[str]:
-        """Generate responses for multi-round conversations"""
-        eval_logger.warning("generate_until_multi_round not implemented for MMaDA, using generate_until")
-        return self.generate_until(requests)
+    def generate_until_multi_round(self, requests) -> List[str]:
+        """Multi-round dialogue generation"""
+        raise NotImplementedError(
+            "TODO: Implement multi-round dialogue generation for MMaDA"
+        )
