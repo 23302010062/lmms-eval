@@ -67,13 +67,19 @@ class STAR7B(lmms):
         seed: int = 0,
         continual_mode: bool = True,
         response_persistent_folder: Optional[str] = None,
-        # STAR model args
-        max_pixels: int = 28 * 28 * 1024,
-        min_pixels: int = 28 * 28 * 16,
+        batch_size: int = 1,
+        # System prompt (aligned with qwen_vl default)
+        system_prompt: str = "You are a helpful assistant.",
+        # STAR model args - use Qwen2.5-VL defaults for compatibility
+        max_pixels: int = 1605632,   # Qwen2.5-VL default
+        min_pixels: int = 200704,    # Qwen2.5-VL default (256 * 28 * 28)
         max_seq_length: int = 8192,
         max_text_tokens: int = 512,
         grad_ckpt: bool = False,
         diffusion_as_decoder: bool = False,
+        # Generation parameters (aligned with qwen_vl)
+        temperature: float = 0.0,
+        num_beams: int = 1,
         # Generation args
         vq_image_size: int = 384,
         vq_tokens: int = 576,
@@ -97,8 +103,20 @@ class STAR7B(lmms):
         self.pretrained = pretrained
         self.seed = seed
         self.continual_mode = continual_mode
-
-        # Generation parameters
+        self.batch_size_per_gpu = int(batch_size)  # Convert to int (aligned with qwen_vl)
+        
+        # System prompt (optional, empty string means no system prompt)
+        self.system_prompt = system_prompt
+        
+        # Image resolution parameters (aligned with qwen_vl)
+        self.max_pixels = max_pixels
+        self.min_pixels = min_pixels
+        
+        # Generation parameters (aligned with qwen_vl)
+        self.temperature = temperature
+        self.num_beams = num_beams
+        
+        # STAR-specific generation parameters
         self.vq_image_size = vq_image_size
         self.vq_tokens = vq_tokens
         self.topk = topk
@@ -177,6 +195,10 @@ class STAR7B(lmms):
             self.accelerator = accelerator
             self._rank = 0
             self._world_size = 1
+        
+        # Set padding strategy based on batch_size (aligned with qwen_vl)
+        # For batch_size > 1, use left padding for generation
+        self.padding_side = "left" if self.batch_size_per_gpu > 1 else "right"
 
         # Create args object for STAR model (mimicking inference scripts)
         class Args:
@@ -196,9 +218,23 @@ class STAR7B(lmms):
         # Load model using STAR's model_setup pattern
         eval_logger.info(f"Loading STAR model from {pretrained}")
         self._load_model()
+        
+        # In understanding mode, reset image_processor to Qwen defaults for compatibility
+        if self.mode == "understanding":
+            eval_logger.info("Resetting image_processor to Qwen2.5-VL defaults for understanding mode")
+            # Reset to Qwen2.5-VL default values (from qwen2_5_vl.py)
+            self._star_model.image_processor.max_pixels = 1605632
+            self._star_model.image_processor.min_pixels = 200704  # 256 * 28 * 28
+            eval_logger.info(f"Image processor max_pixels: {self._star_model.image_processor.max_pixels}")
+            eval_logger.info(f"Image processor min_pixels: {self._star_model.image_processor.min_pixels}")
 
         # Monkey patch inference_understand to support multiple images
         self._patch_inference_understand()
+        
+        # Configure tokenizer padding (aligned with qwen_vl)
+        if hasattr(self._star_model, 'tokenizer'):
+            self._star_model.tokenizer.padding_side = self.padding_side
+            eval_logger.info(f"Set tokenizer padding_side to: {self.padding_side}")
 
         eval_logger.info("STAR model initialized successfully")
 
@@ -225,28 +261,50 @@ class STAR7B(lmms):
                 # Text-only input
                 content.append({"type": "text", "text": question})
             elif isinstance(image, list):
-                # Multiple images
+                # Multiple images - convert to base64 to match qwen_vl behavior exactly
+                import base64
+                from io import BytesIO
+
                 for img in image:
                     if img is not None:
-                        pil_image = self._star_model.preprocess_image(img)
-                        content.append({"type": "image", "image": pil_image})
+                        # Convert PIL Image to base64 string (same as qwen_vl)
+                        base64_image = img.convert("RGB")
+                        buffer = BytesIO()
+                        base64_image.save(buffer, format="JPEG")
+                        base64_bytes = base64.b64encode(buffer.getvalue())
+                        base64_string = base64_bytes.decode("utf-8")
+
+                        content.append({
+                            "type": "image",
+                            "image": f"data:image/jpeg;base64,{base64_string}",
+                            "max_pixels": self.max_pixels,
+                            "min_pixels": self.min_pixels,
+                        })
                 content.append({"type": "text", "text": question})
             else:
                 # Single image - use original method
                 return original_inference_understand(image, question, max_new_tokens)
 
-            # Multi-image or text-only path
-            messages = [{"role": "user", "content": content}]
+            # Build messages in batch format (aligned with qwen_vl)
+            # Use standard message structure: [[system_msg, user_msg]]
+            message = []
+            if self.system_prompt:
+                message.append({"role": "system", "content": self.system_prompt})
+            message.append({"role": "user", "content": content})
+            messages = [message]  # Wrap in list for batch processing
 
             from qwen_vl_utils import process_vision_info
 
             # Preparation for inference
-            text = self._star_model.processor.apply_chat_template(
+            texts = self._star_model.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
+            # apply_chat_template returns list in batch mode, extract first element
+            text = texts[0] if isinstance(texts, list) else texts
+
             image_inputs, video_inputs = process_vision_info(messages)
             inputs = self._star_model.processor(
-                text=[text],
+                text=[text],  # Re-wrap as list for processor
                 images=image_inputs,
                 videos=video_inputs,
                 padding=True,
@@ -254,9 +312,26 @@ class STAR7B(lmms):
             )
             inputs = inputs.to(self._star_model.llm.device)
 
-            # Inference: Generation of the output
+            # Inference: Generation with parameters (aligned with qwen_vl)
+            # Build generation kwargs
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "num_beams": self.num_beams,
+                "do_sample": True if self.temperature > 0 else False,
+            }
+            
+            # Only add temperature if > 0 (aligned with qwen_vl)
+            if self.temperature > 0:
+                gen_kwargs["temperature"] = self.temperature
+            
+            # Add eos_token_id and pad_token_id (aligned with qwen_vl)
+            if hasattr(self._star_model.tokenizer, 'eod_id'):
+                gen_kwargs["eos_token_id"] = self._star_model.tokenizer.eod_id
+                gen_kwargs["pad_token_id"] = self._star_model.tokenizer.pad_token_id if self._star_model.tokenizer.pad_token_id is not None else self._star_model.tokenizer.eod_id
+            
             generated_ids = self._star_model.llm.generate(
-                **inputs, max_new_tokens=max_new_tokens
+                **inputs,
+                **gen_kwargs,
             )
             generated_ids_trimmed = [
                 out_ids[len(in_ids):]
@@ -411,6 +486,10 @@ class STAR7B(lmms):
     @property
     def config(self):
         return self._star_model.config
+    
+    @property
+    def batch_size(self):
+        return self.batch_size_per_gpu
 
     def set_seed(self, seed: int):
         """Set random seeds for reproducibility"""
@@ -424,7 +503,7 @@ class STAR7B(lmms):
                 torch.cuda.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
 
-    def understand_image(self, prompt: str, images, doc_id: str) -> str:
+    def understand_image(self, prompt: str, images, doc_id: str, max_new_tokens: Optional[int] = None) -> str:
         """
         Understand image(s) and answer question using STAR's inference_understand API
 
@@ -432,11 +511,16 @@ class STAR7B(lmms):
             prompt: Input text prompt/question
             images: PIL Image, list of PIL Images, or None
             doc_id: Document ID for logging
+            max_new_tokens: Maximum tokens to generate (optional, uses self.max_new_tokens if None)
 
         Returns:
             Generated text answer
         """
         self.set_seed(self.seed)
+        
+        # Use provided max_new_tokens or fall back to default
+        if max_new_tokens is None:
+            max_new_tokens = self.max_new_tokens
 
         # Handle different image input types
         if images is None:
@@ -457,7 +541,7 @@ class STAR7B(lmms):
         # Use STAR's native inference_understand method (patched to support multi-images)
         with torch.no_grad():
             answer = self._star_model.inference_understand(
-                image=image, question=prompt, max_new_tokens=self.max_new_tokens
+                image=image, question=prompt, max_new_tokens=max_new_tokens
             )
 
         return answer
@@ -576,8 +660,11 @@ class STAR7B(lmms):
                         )
                         visuals = None
 
+                # Get max_new_tokens from gen_kwargs if provided (aligned with qwen_vl)
+                max_new_tokens = gen_kwargs.get("max_new_tokens", self.max_new_tokens) if gen_kwargs else self.max_new_tokens
+
                 # Call understand_image with images (can be None, single image, or list)
-                output_text = self.understand_image(prompt, visuals, str(doc_id))
+                output_text = self.understand_image(prompt, visuals, str(doc_id), max_new_tokens=max_new_tokens)
                 formatted_output = output_text
 
             else:

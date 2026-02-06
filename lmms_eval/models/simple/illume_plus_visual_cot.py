@@ -292,6 +292,7 @@ class ILLUMEPlusVisualCoT(lmms):
             eval_logger.info(f"Loading processor from {pretrained}")
             processor_kwargs = {
                 "trust_remote_code": self.trust_remote_code,
+                "local_files_only": False,
             }
 
             # Disable flash_attn if it's causing import errors
@@ -332,10 +333,14 @@ class ILLUMEPlusVisualCoT(lmms):
             eval_logger.info(f"Loading model from {pretrained} to {self._device}")
 
             # Determine device_map strategy
-            if self.infer_auto_device_map:
+            # Check if we're in a distributed environment
+            import torch.cuda
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            
+            if self.infer_auto_device_map and num_gpus > 1:
                 final_device_map = "auto"
                 eval_logger.info(
-                    "Using infer_auto_device_map for multi-GPU model parallelism"
+                    f"Using infer_auto_device_map for multi-GPU model parallelism ({num_gpus} GPUs)"
                 )
             elif self.device_map is not None:
                 final_device_map = self.device_map
@@ -561,6 +566,7 @@ class ILLUMEPlusVisualCoT(lmms):
 
             eval_logger.info(f"Targeting model directory: {model_dir}")
 
+            # Mock flash_attn if not available
             flash_attn_available = False
             try:
                 import flash_attn
@@ -572,6 +578,28 @@ class ILLUMEPlusVisualCoT(lmms):
                 mock_module = ModuleType(mock_name)
                 mock_module.__spec__ = importlib.machinery.ModuleSpec(mock_name, None)
                 sys.modules[mock_name] = mock_module
+
+            # Mock torch_xla if not available (TPU-specific, not needed for GPU)
+            torch_xla_available = False
+            try:
+                import torch_xla
+                torch_xla_available = True
+            except (ImportError, RuntimeError, ValueError):
+                eval_logger.warning("torch_xla not available (TPU-specific), creating a mock for GPU usage.")
+                
+                mock_name = 'torch_xla'
+                mock_module = ModuleType(mock_name)
+                mock_module.__spec__ = importlib.machinery.ModuleSpec(mock_name, None)
+                sys.modules[mock_name] = mock_module
+                
+                # Also mock torch_xla.core.xla_model which might be imported
+                mock_core = ModuleType('torch_xla.core')
+                mock_core.__spec__ = importlib.machinery.ModuleSpec('torch_xla.core', None)
+                sys.modules['torch_xla.core'] = mock_core
+                
+                mock_xla_model = ModuleType('torch_xla.core.xla_model')
+                mock_xla_model.__spec__ = importlib.machinery.ModuleSpec('torch_xla.core.xla_model', None)
+                sys.modules['torch_xla.core.xla_model'] = mock_xla_model
 
             try:
                 dualvitok = (
@@ -587,6 +615,10 @@ class ILLUMEPlusVisualCoT(lmms):
             finally:
                 if not flash_attn_available and 'flash_attn' in sys.modules:
                     del sys.modules['flash_attn']
+                if not torch_xla_available:
+                    for module_name in ['torch_xla.core.xla_model', 'torch_xla.core', 'torch_xla']:
+                        if module_name in sys.modules:
+                            del sys.modules[module_name]
 
             if hasattr(self._processor, "set_vision_tokenizer"):
                 self._processor.set_vision_tokenizer(dualvitok)
@@ -931,10 +963,25 @@ class ILLUMEPlusVisualCoT(lmms):
                 return best_resolution
 
             # Use closest supported resolution
-            h, w = find_closest_resolution(h, w, SUPPORTED_RESOLUTIONS)
-            eval_logger.info(f"Using supported resolution: {h}x{w}")
+            # MEMORY OPTIMIZATION: Force 256x256 for low memory situations
+            # Uncomment the line below to always use minimum resolution
+            h, w = 256, 256  # Force minimum resolution to save memory
+            # h, w = find_closest_resolution(h, w, SUPPORTED_RESOLUTIONS)
+            eval_logger.info(f"Using supported resolution: {h}x{w} (forced minimum for memory optimization)")
 
             resolution_tag = f"<height_{h}><width_{w}>"
+
+            # CRITICAL FIX for geometry3k_visual_cot: Remove <image> tags
+            # geometry3k prompts contain <image> tags in the problem text,
+            # but ILLUME+ already provides images through conversation structure.
+            # Having <image> in text creates extra placeholder causing
+            # "not enough images for placeholders" error.
+            # Only apply this fix for geometry3k_visual_cot task.
+            if task == "geometry3k_visual_cot":
+                generation_prompt_cleaned = re.sub(r'<image>', '', generation_prompt).strip()
+                eval_logger.info(f"Applied geometry3k_visual_cot fix: removed <image> tags from prompt")
+            else:
+                generation_prompt_cleaned = generation_prompt
 
             # CRITICAL: Force image generation by explicitly requesting it in the prompt
             # Similar to MIO's approach, we make it clear that an image MUST be generated
@@ -942,14 +989,14 @@ class ILLUMEPlusVisualCoT(lmms):
                 # Image editing mode - explicitly request edited image output
                 full_prompt = (
                     f"{resolution_tag}\n"
-                    f"Edit the image according to this instruction: {generation_prompt}"
+                    f"Edit the image according to this instruction: {generation_prompt_cleaned}"
                 )
                 uncond_prompt = f"{resolution_tag}\nReconstruct the image according to the given image\n"
             else:
                 # Image generation mode - explicitly request image output
                 full_prompt = (
                     f"{resolution_tag}\n"
-                    f"Generate an image with the following content: {generation_prompt}"
+                    f"Generate an image with the following content: {generation_prompt_cleaned}"
                 )
                 uncond_prompt = f"Generate a random image of {resolution_tag}\n"
 
@@ -1233,12 +1280,25 @@ class ILLUMEPlusVisualCoT(lmms):
             if self.fail_gracefully:
                 return "", []
             raise
+        finally:
+            # Force CUDA synchronization and cleanup to prevent memory issues
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
     def _stage2_answer_with_images(
-        self, question: str, generated_image_paths: List[str], original_images: List[Image.Image] = None
+        self, question: str, generated_image_paths: List[str], original_images: List[Image.Image] = None, task: str = None
     ) -> str:
         eval_logger.debug("Stage 2 - Answering question with multiple images")
         try:
+            # CRITICAL FIX for geometry3k_visual_cot: Remove <image> tags from question
+            # Same issue as Stage 1 - images are provided through conversation structure
+            if task == "geometry3k_visual_cot":
+                question_cleaned = re.sub(r'<image>', '', question).strip()
+                eval_logger.info(f"Applied geometry3k_visual_cot fix in Stage 2: removed <image> tags from question")
+            else:
+                question_cleaned = question
+            
             images = []
 
             if original_images:
@@ -1267,7 +1327,7 @@ class ILLUMEPlusVisualCoT(lmms):
                     "role": "user",
                     "content": (
                         [{"type": "image"}] * len(images)
-                        + [{"type": "text", "text": question}]
+                        + [{"type": "text", "text": question_cleaned}]  # Use cleaned question
                     ),
                 },
             ]
@@ -1315,6 +1375,11 @@ class ILLUMEPlusVisualCoT(lmms):
             if self.fail_gracefully:
                 return ""
             raise
+        finally:
+            # Force CUDA synchronization and cleanup to prevent memory issues
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
             
 
     def _save_intermediate_artifacts(
@@ -1414,9 +1479,6 @@ class ILLUMEPlusVisualCoT(lmms):
                 if extracted_img is not None:
                     original_images.append(extracted_img)
 
-        # For backward compatibility, use first image as single original_image
-        original_image = original_images[0] if original_images else None
-
         generated_images = []
 
         if task_type == "jigsaw":
@@ -1429,7 +1491,7 @@ class ILLUMEPlusVisualCoT(lmms):
                 generation_prompt=gen_prompt1,
                 doc_id=f"{doc_id}_cand0",
                 task=task,
-                original_images=original_images,
+                original_images=original_images,  # Pass all original images
             )
             if img_paths_0:
                 generated_images.extend(img_paths_0)
@@ -1443,7 +1505,7 @@ class ILLUMEPlusVisualCoT(lmms):
                 generation_prompt=gen_prompt2,
                 doc_id=f"{doc_id}_cand1",
                 task=task,
-                original_images=original_images,
+                original_images=original_images,  # Pass all original images
             )
             if img_paths_1:
                 generated_images.extend(img_paths_1)
@@ -1462,11 +1524,11 @@ class ILLUMEPlusVisualCoT(lmms):
                 gen_img0 = Image.open(generated_images[0]).convert("RGB")
                 gen_img1 = Image.open(generated_images[1]).convert("RGB")
 
-                # Build images list
+                # Build images list: original images + generated images
                 images = []
-                if original_image:
-                    images.append(original_image)
-                images.extend([gen_img0, gen_img1])
+                if original_images:
+                    images.extend(original_images)  # Add all original images
+                images.extend([gen_img0, gen_img1])  # Add generated images
 
                 # Normalize image sizes to ensure consistent dimensions
                 images = self._normalize_image_sizes(images)
@@ -1556,11 +1618,11 @@ class ILLUMEPlusVisualCoT(lmms):
                     Image.open(img_path).convert("RGB") for img_path in generated_images
                 ]
 
-                # Build images list
+                # Build images list: original images + generated step images
                 images = []
-                if original_image:
-                    images.append(original_image)
-                images.extend(step_images)
+                if original_images:
+                    images.extend(original_images)  # Add all original images
+                images.extend(step_images)  # Add generated step images
 
                 # Normalize image sizes to ensure consistent dimensions
                 images = self._normalize_image_sizes(images)
@@ -1716,7 +1778,8 @@ class ILLUMEPlusVisualCoT(lmms):
                 final_answer = self._stage2_answer_with_images(
                     question=contexts,
                     generated_image_paths=generated_images,
-                    original_images=original_images
+                    original_images=original_images,
+                    task=task  # Pass task parameter for geometry3k fix
                 )
             else:
                 final_answer = stage1_text if stage1_text else ""
