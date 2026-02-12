@@ -25,6 +25,7 @@ Usage for generation:
 """
 
 import json
+import math
 import os
 from typing import List, Optional, Tuple
 
@@ -36,6 +37,44 @@ from tqdm import tqdm
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
+
+
+def concatenate_images(images: List[Image.Image]) -> Image.Image:
+    """
+    Concatenate multiple images into a single image using grid layout.
+
+    Args:
+        images: List of PIL Images to concatenate
+
+    Returns:
+        Single PIL Image containing all input images in a grid
+    """
+    if len(images) == 1:
+        return images[0]
+
+    # Determine grid size (rows x cols)
+    n_images = len(images)
+    cols = math.ceil(math.sqrt(n_images))
+    rows = math.ceil(n_images / cols)
+
+    # Find max dimensions to make all images the same size
+    max_width = max(img.width for img in images)
+    max_height = max(img.height for img in images)
+
+    # Create canvas
+    canvas_width = max_width * cols
+    canvas_height = max_height * rows
+    canvas = Image.new('RGB', (canvas_width, canvas_height), color=(255, 255, 255))
+
+    # Paste images onto canvas
+    for idx, img in enumerate(images):
+        row = idx // cols
+        col = idx % cols
+        x = col * max_width
+        y = row * max_height
+        canvas.paste(img, (x, y))
+
+    return canvas
 
 
 @register_model("emu3")
@@ -131,6 +170,13 @@ class Emu3(lmms):
                 eval_logger.warning("flash_attn not installed, falling back to eager attention")
                 attn_implementation = "eager"
 
+        # Print GPU memory before loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            mem_before = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved_before = torch.cuda.memory_reserved() / 1024**3
+            eval_logger.info(f"GPU memory BEFORE loading: {mem_before:.2f} GB allocated, {mem_reserved_before:.2f} GB reserved")
+
         # Load processor
         self.processor = Emu3Processor.from_pretrained(self.pretrained)
 
@@ -146,18 +192,49 @@ class Emu3(lmms):
                 device_map="auto",
                 attn_implementation=attn_implementation,
                 trust_remote_code=True,
+                low_cpu_mem_usage=True,
             ).eval()
             eval_logger.info(f"Model loaded with automatic device mapping")
         else:
-            # Single device
-            device = torch.device(self.device_str if torch.cuda.is_available() else "cpu")
+            # Single device - use device_map to load directly to GPU without CPU intermediate
+            device = self.device_str if torch.cuda.is_available() else "cpu"
             self.model = Emu3ForConditionalGeneration.from_pretrained(
                 self.pretrained,
                 torch_dtype=dtype,
+                device_map=device,  # Load directly to device, avoid CPU->GPU copy
                 attn_implementation=attn_implementation,
                 trust_remote_code=True,
-            ).to(device).eval()
+                low_cpu_mem_usage=True,  # Important: avoid loading full model in CPU first
+            ).eval()
             eval_logger.info(f"Model loaded on {device}")
+
+        # Print model statistics
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            mem_after = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved_after = torch.cuda.memory_reserved() / 1024**3
+            eval_logger.info(f"GPU memory AFTER loading: {mem_after:.2f} GB allocated, {mem_reserved_after:.2f} GB reserved")
+
+        # Count model parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        eval_logger.info(f"Model parameters: {total_params / 1e9:.2f}B total, {trainable_params / 1e9:.2f}B trainable")
+
+        # Check dtypes
+        dtypes = {}
+        for name, param in self.model.named_parameters():
+            dtype_str = str(param.dtype)
+            dtypes[dtype_str] = dtypes.get(dtype_str, 0) + param.numel()
+        eval_logger.info("Parameter dtypes:")
+        for dtype_str, count in sorted(dtypes.items()):
+            size_gb = count * 2 / 1024**3 if 'float16' in dtype_str or 'bfloat16' in dtype_str else count * 4 / 1024**3
+            eval_logger.info(f"  {dtype_str}: {count / 1e9:.2f}B params ({size_gb:.2f} GB)")
+
+        # Check model components
+        eval_logger.info("Model components:")
+        for name, module in self.model.named_children():
+            component_params = sum(p.numel() for p in module.parameters())
+            eval_logger.info(f"  {name}: {component_params / 1e9:.2f}B params")
 
     @property
     def batch_size(self):
@@ -264,12 +341,12 @@ class Emu3(lmms):
 
     def _generate_multimodal(self, context: str, images: List[Image.Image], gen_kwargs: dict) -> str:
         """Generate multimodal response (image understanding)"""
-        # For single image, we can pass it directly
-        # For multiple images, use the first one
-        if len(images) == 1:
-            image = images[0]
+        # Handle multiple images by concatenating them into a single image
+        num_original_images = len(images)
+        if len(images) > 1:
+            eval_logger.info(f"Concatenating {len(images)} images into a single image")
+            image = concatenate_images(images)
         else:
-            eval_logger.warning(f"Multiple images provided ({len(images)}), using first image only")
             image = images[0]
 
         # Debug: log image info
@@ -278,6 +355,11 @@ class Emu3(lmms):
         # Ensure image is RGB
         if hasattr(image, 'mode') and image.mode != 'RGB':
             image = image.convert('RGB')
+
+        # Print GPU memory before processing
+        if torch.cuda.is_available():
+            mem_before_process = torch.cuda.memory_allocated() / 1024**3
+            eval_logger.debug(f"GPU memory before processing: {mem_before_process:.2f} GB")
 
         # Build conversation using chat template (required by Emu3)
         # Format from official docs: https://huggingface.co/docs/transformers/en/model_doc/emu3
@@ -293,7 +375,25 @@ class Emu3(lmms):
 
         # Apply chat template to get properly formatted prompt
         prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
-        eval_logger.debug(f"Prompt (first 100 chars): {prompt[:100]}")
+
+        # Check if prompt has multiple <image> tokens and fix it
+        # This can happen when:
+        # 1. We concatenated multiple images into one
+        # 2. The task's doc_to_text already included <image> tokens in context
+        import re
+        image_token_count = prompt.count('<image>')
+        if image_token_count > 1:
+            eval_logger.info(f"Prompt has {image_token_count} <image> tokens, but we only have 1 image (concatenated from {num_original_images})")
+            eval_logger.info(f"Replacing multiple <image> tokens with a single one")
+            # Replace multiple consecutive <image> tokens with a single one
+            prompt = re.sub(r'(<image>\s*)+', '<image>', prompt)
+            final_count = prompt.count('<image>')
+            eval_logger.info(f"After replacement, prompt has {final_count} <image> token(s)")
+            if final_count != 1:
+                eval_logger.warning(f"Expected 1 <image> token after replacement, but got {final_count}")
+
+        eval_logger.debug(f"Prompt (first 200 chars): {prompt[:200]}")
+        eval_logger.debug(f"Number of images in conversation: {len([c for c in conversation[0]['content'] if c.get('type') == 'image'])}")
 
         try:
             # Prepare inputs - use list format as per official example
@@ -302,10 +402,36 @@ class Emu3(lmms):
                 text=[prompt],
                 return_tensors="pt",
             ).to(self.model.device, dtype=torch.bfloat16)
+        except StopIteration as e:
+            # Handle StopIteration error - this usually means prompt has more image placeholders than images provided
+            eval_logger.error(f"StopIteration error in processor - prompt may have mismatched image placeholders")
+            eval_logger.error(f"Image info: type={type(image)}, mode={getattr(image, 'mode', 'N/A')}, size={getattr(image, 'size', 'N/A')}")
+            eval_logger.error(f"Prompt length: {len(prompt)}")
+            eval_logger.error(f"Prompt content (first 500 chars): {prompt[:500]}")
+
+            # Try alternative: pass image without wrapping in list
+            eval_logger.warning("Attempting alternative processor call without list wrapping...")
+            try:
+                inputs = self.processor(
+                    images=image,
+                    text=prompt,
+                    return_tensors="pt",
+                ).to(self.model.device, dtype=torch.bfloat16)
+                eval_logger.info("Alternative processor call succeeded")
+            except Exception as e2:
+                eval_logger.error(f"Alternative processor call also failed: {e2}")
+                raise e
         except Exception as e:
             eval_logger.error(f"Processor error: {e}")
             eval_logger.error(f"Image info: type={type(image)}, mode={getattr(image, 'mode', 'N/A')}, size={getattr(image, 'size', 'N/A')}")
             raise
+
+        # Print GPU memory after preparing inputs
+        if torch.cuda.is_available():
+            mem_after_process = torch.cuda.memory_allocated() / 1024**3
+            input_size = sum(v.numel() * v.element_size() for v in inputs.values() if isinstance(v, torch.Tensor)) / 1024**3
+            eval_logger.info(f"GPU memory after preparing inputs: {mem_after_process:.2f} GB (inputs: {input_size:.2f} GB)")
+            eval_logger.info(f"Input shapes: {[(k, v.shape) for k, v in inputs.items() if isinstance(v, torch.Tensor)]}")
 
         # Get generation parameters
         max_new_tokens = gen_kwargs.get("max_new_tokens", self.max_new_tokens)
